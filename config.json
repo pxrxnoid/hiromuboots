@@ -1,0 +1,14 @@
+{
+  "POLL_INTERVAL_SECONDS": 300,
+  "SEARCH_QUERIES": [
+    "hiromu takahara",
+    "ヒロム タカハラ",
+    "ヒロムタカハラ",
+    "hiromu takahara shoes",
+    "takahara hiromu"
+  ],
+  "MERCARI_CATEGORY_ID": [5, 1243],
+  "JPY_USD_RATE": 0.0064,
+  "FAILURE_ALERT_MINUTES": 30,
+  "PAGE_SIZE": 40
+}
