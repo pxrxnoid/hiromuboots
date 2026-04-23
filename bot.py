@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -9,11 +10,14 @@ import re
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
+import jwt
+from cryptography.hazmat.primitives.asymmetric import ec
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -21,11 +25,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.json"
-DB_PATH = ROOT / "seen.db"
+DB_PATH = Path(os.environ.get("DB_PATH") or ROOT / "seen.db")
 
 MERCARI_SEARCH_API = "https://api.mercari.jp/v2/entities:search"
-MERCARI_SEARCH_URL = "https://jp.mercari.com/search"
 MERCARI_ITEM_URL = "https://jp.mercari.com/item/{id}"
+THUMB_BASE = "https://static.mercdn.net/c!/w=240/thumb/photos/{id}_1.jpg"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -47,10 +51,9 @@ DEFAULTS: dict[str, Any] = {
         "hiromu takahara shoes",
         "takahara hiromu",
     ],
-    # Mercari JP category IDs. Empty list = no category filter (rely on keyword).
-    # Common shoes/footwear parent IDs on Mercari JP: 5 (women's shoes), 1243 (men's shoes).
-    # Override in config.json or via MERCARI_CATEGORY_ID env var (comma-separated).
-    "MERCARI_CATEGORY_ID": [5, 1243],
+    # Empty = no category filter (keyword alone is specific enough).
+    # Known footwear category id: 8744 (boots/shoes seen in Mercari responses).
+    "MERCARI_CATEGORY_ID": [],
     "JPY_USD_RATE": 0.0064,
     "FAILURE_ALERT_MINUTES": 30,
     "PAGE_SIZE": 40,
@@ -64,7 +67,6 @@ def load_config() -> dict:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception as e:
             log.warning("config.json unreadable: %s", e)
-    # env overrides
     for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
         if os.environ.get(key):
             cfg[key] = os.environ[key]
@@ -74,7 +76,7 @@ def load_config() -> dict:
         cfg["SEARCH_QUERIES"] = [
             q.strip() for q in os.environ["SEARCH_QUERIES"].split(",") if q.strip()
         ]
-    if os.environ.get("MERCARI_CATEGORY_ID"):
+    if os.environ.get("MERCARI_CATEGORY_ID") is not None:
         raw = os.environ["MERCARI_CATEGORY_ID"].strip()
         cfg["MERCARI_CATEGORY_ID"] = (
             [int(x) for x in raw.split(",") if x.strip().isdigit()] if raw else []
@@ -83,7 +85,6 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    # persist everything except tokens/chat id (those come from env)
     public = {k: v for k, v in cfg.items() if k not in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")}
     CONFIG_PATH.write_text(json.dumps(public, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -124,9 +125,47 @@ def db_meta_set(con: sqlite3.Connection, key: str, value: str) -> None:
     con.commit()
 
 
-# ---------- mercari ----------
+# ---------- DPoP ----------
 
-def _cat_ids_as_strings(category_id: Any) -> list[str]:
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+class DPoPSigner:
+    """Generates per-request DPoP JWTs. Mercari's public web client uses the
+    same shape: ES256 over an ephemeral P-256 key, with jwk in header and
+    iat/jti/htu/htm/uuid in claims."""
+
+    def __init__(self) -> None:
+        self._key = ec.generate_private_key(ec.SECP256R1())
+        pub = self._key.public_key().public_numbers()
+        self._jwk = {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": _b64u(pub.x.to_bytes(32, "big")),
+            "y": _b64u(pub.y.to_bytes(32, "big")),
+        }
+        self._device_uuid = str(uuid.uuid4())
+
+    def sign(self, method: str, url: str) -> str:
+        claims = {
+            "iat": int(time.time()),
+            "jti": str(uuid.uuid4()),
+            "htu": url,
+            "htm": method,
+            "uuid": self._device_uuid,
+        }
+        return jwt.encode(
+            claims,
+            self._key,
+            algorithm="ES256",
+            headers={"typ": "dpop+jwt", "jwk": self._jwk},
+        )
+
+
+# ---------- Mercari search ----------
+
+def _cat_ids(category_id: Any) -> list[str]:
     if not category_id:
         return []
     if isinstance(category_id, (list, tuple)):
@@ -134,127 +173,128 @@ def _cat_ids_as_strings(category_id: Any) -> list[str]:
     return [str(category_id)]
 
 
-async def fetch_api(
-    client: httpx.AsyncClient, keyword: str, category_id: Any, page_size: int
-) -> list[dict]:
-    body: dict[str, Any] = {
-        "keyword": keyword,
+def _build_body(keyword: str, category_ids: list[str], page_size: int) -> dict:
+    return {
+        "userId": "",
         "pageSize": page_size,
-        "status": ["STATUS_ON_SALE"],
-        "sort": "SORT_CREATED_TIME",
-        "order": "ORDER_DESC",
-        "searchSessionId": "",
+        "pageToken": "",
+        "searchSessionId": str(uuid.uuid4()),
         "indexRouting": "INDEX_ROUTING_UNSPECIFIED",
         "thumbnailTypes": [],
+        "searchCondition": {
+            "keyword": keyword,
+            "excludeKeyword": "",
+            "sort": "SORT_CREATED_TIME",
+            "order": "ORDER_DESC",
+            "status": ["STATUS_ON_SALE"],
+            "sizeId": [],
+            "categoryId": category_ids,
+            "brandId": [],
+            "sellerId": [],
+            "priceMin": 0,
+            "priceMax": 0,
+            "itemConditionId": [],
+            "shippingPayerId": [],
+            "shippingFromArea": [],
+            "shippingMethod": [],
+            "colorId": [],
+            "hasCoupon": False,
+            "attributes": [],
+            "itemTypes": [],
+            "skuIds": [],
+        },
+        "defaultDatasets": [],
         "serviceFrom": "suruga",
+        "withItemBrand": True,
+        "withItemSize": False,
+        "withItemPromotions": True,
+        "withItemSizes": True,
+        "withShopname": False,
     }
-    cats = _cat_ids_as_strings(category_id)
-    if cats:
-        body["categoryId"] = cats
-    headers = {
-        "X-Platform": "web",
-        "Accept": "*/*",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-        "Origin": "https://jp.mercari.com",
-        "Referer": "https://jp.mercari.com/",
-    }
-    resp = await client.post(MERCARI_SEARCH_API, json=body, headers=headers, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("items") or []
-
-
-async def fetch_html_fallback(
-    client: httpx.AsyncClient, keyword: str, category_id: Any
-) -> list[dict]:
-    params: dict[str, str] = {
-        "keyword": keyword,
-        "status": "on_sale",
-        "sort": "created_time",
-        "order": "desc",
-    }
-    cats = _cat_ids_as_strings(category_id)
-    if cats:
-        params["category_id"] = ",".join(cats)
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html"}
-    resp = await client.get(MERCARI_SEARCH_URL, params=params, headers=headers, timeout=20)
-    resp.raise_for_status()
-    m = re.search(
-        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp.text, re.DOTALL
-    )
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return []
-
-    items: list[dict] = []
-    seen: set[str] = set()
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            arr = node.get("items")
-            if isinstance(arr, list):
-                for it in arr:
-                    if isinstance(it, dict):
-                        iid = it.get("id")
-                        if iid and iid not in seen:
-                            seen.add(iid)
-                            items.append(it)
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(data)
-    return items
 
 
 async def fetch_query(
-    client: httpx.AsyncClient, keyword: str, category_id: Any, page_size: int
+    client: httpx.AsyncClient,
+    signer: DPoPSigner,
+    keyword: str,
+    category_id: Any,
+    page_size: int,
 ) -> list[dict]:
-    delay = 2
+    body = _build_body(keyword, _cat_ids(category_id), page_size)
+    delay = 2.0
+    last_err: Exception | None = None
     for attempt in range(5):
+        headers = {
+            "DPoP": signer.sign("POST", MERCARI_SEARCH_API),
+            "X-Platform": "web",
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            "Origin": "https://jp.mercari.com",
+            "Referer": "https://jp.mercari.com/",
+        }
         try:
-            return await fetch_api(client, keyword, category_id, page_size)
-        except httpx.HTTPStatusError as e:
-            code = e.response.status_code
-            if code == 429 or 500 <= code < 600:
-                log.warning("api %s on %r (attempt %d); backoff %ds", code, keyword, attempt + 1, delay)
+            resp = await client.post(MERCARI_SEARCH_API, json=body, headers=headers, timeout=20)
+        except httpx.RequestError as e:
+            last_err = e
+            log.warning("transport error %r (attempt %d); backoff %.0fs", e, attempt + 1, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                return resp.json().get("items") or []
+            except json.JSONDecodeError as e:
+                last_err = e
+                log.warning("200 but json decode failed: %s", e)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
                 continue
-            log.warning("api error %s on %r; trying HTML fallback", code, keyword)
-            break
-        except (httpx.RequestError, json.JSONDecodeError) as e:
-            log.warning("api transport/json error on %r: %s; trying HTML fallback", keyword, e)
-            break
-    return await fetch_html_fallback(client, keyword, category_id)
+
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            log.warning(
+                "api %s on %r (attempt %d); backoff %.0fs",
+                resp.status_code, keyword, attempt + 1, delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+
+        raise RuntimeError(f"mercari api {resp.status_code}: {resp.text[:200]}")
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("mercari api retries exhausted")
 
 
 def normalize(raw: dict) -> dict:
-    item_id = raw.get("id") or ""
-    name = raw.get("name") or raw.get("title") or ""
+    item_id = str(raw.get("id") or "")
+    title = str(raw.get("name") or raw.get("title") or "")
     price = raw.get("price")
-    thumbnails = raw.get("thumbnails") or []
-    if thumbnails and isinstance(thumbnails[0], dict):
-        thumb = thumbnails[0].get("url") or thumbnails[0].get("uri") or ""
-    elif thumbnails:
-        thumb = thumbnails[0]
-    else:
-        thumb = raw.get("thumbnail") or ""
     try:
         price_int = int(price) if price is not None else None
     except (TypeError, ValueError):
         price_int = None
+
+    thumb = ""
+    thumbs = raw.get("thumbnails")
+    if isinstance(thumbs, list) and thumbs:
+        first = thumbs[0]
+        if isinstance(first, str):
+            thumb = first
+        elif isinstance(first, dict):
+            thumb = first.get("url") or first.get("uri") or ""
+    if not thumb:
+        thumb = raw.get("thumbnail") or ""
+    if not thumb and item_id:
+        thumb = THUMB_BASE.format(id=item_id)
+
     return {
-        "id": str(item_id),
-        "title": str(name),
+        "id": item_id,
+        "title": title,
         "price": price_int,
-        "thumbnail": str(thumb) if thumb else "",
+        "thumbnail": thumb,
         "url": MERCARI_ITEM_URL.format(id=item_id),
     }
 
@@ -329,6 +369,7 @@ class Poller:
         self.app = app
         self.cfg = cfg
         self.con = con
+        self.signer = DPoPSigner()
         self.last_scan_at: datetime | None = None
         self.last_success_at: datetime = datetime.now(timezone.utc)
         self.alert_sent = False
@@ -360,7 +401,8 @@ class Poller:
         for q in list(self.cfg["SEARCH_QUERIES"]):
             try:
                 raw_list = await fetch_query(
-                    client, q, self.cfg.get("MERCARI_CATEGORY_ID"), self.cfg["PAGE_SIZE"]
+                    client, self.signer, q,
+                    self.cfg.get("MERCARI_CATEGORY_ID"), self.cfg["PAGE_SIZE"],
                 )
                 any_success = True
             except Exception as e:
@@ -459,6 +501,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = ctx.application.bot_data["cfg"]
+    poller: Poller = ctx.application.bot_data["poller"]
     if not ctx.args:
         await update.message.reply_text("Usage: /search <query>")
         return
@@ -466,7 +509,7 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Searching: {q} ...")
     async with httpx.AsyncClient() as client:
         try:
-            raw_list = await fetch_query(client, q, cfg.get("MERCARI_CATEGORY_ID"), 10)
+            raw_list = await fetch_query(client, poller.signer, q, cfg.get("MERCARI_CATEGORY_ID"), 10)
         except Exception as e:
             await update.message.reply_text(f"Error: {e}")
             return
@@ -516,7 +559,6 @@ async def post_init(app: Application) -> None:
         len(cfg["SEARCH_QUERIES"]),
     )
 
-    # Render free tier requires an HTTP listener on $PORT; if PORT is unset we skip.
     port = os.environ.get("PORT")
     if port and port.isdigit():
         server = await asyncio.start_server(_handle_health, "0.0.0.0", int(port))

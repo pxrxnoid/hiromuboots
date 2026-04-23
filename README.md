@@ -36,11 +36,15 @@ Env vars `SEARCH_QUERIES` and `MERCARI_CATEGORY_ID` accept comma-separated value
 
 ## Fetching strategy
 
-Primary: POST `https://api.mercari.jp/v2/entities:search` with `X-Platform: web`, keyword + category + `STATUS_ON_SALE` + `SORT_CREATED_TIME DESC`.
+POST `https://api.mercari.jp/v2/entities:search` with:
 
-Fallback (on 4xx not in {429}, network/JSON errors): GET the search page HTML and extract the `__NEXT_DATA__` JSON blob.
+- **DPoP header** — per-request JWT signed with an ephemeral ECDSA P-256 key. Mercari's web client does the same thing; without it the API returns 401. Implemented in `DPoPSigner`.
+- **X-Platform: web**, realistic User-Agent, Origin/Referer set to `https://jp.mercari.com`.
+- **Nested `searchCondition`** body — Mercari's current v2 schema wraps keyword/status/sort/categoryId inside a `searchCondition` object (the flat form returns 400).
 
-429 / 5xx trigger exponential backoff (2s → 60s cap, 5 attempts) before falling back.
+429 / 5xx / transport errors retry with exponential backoff (2s → 60s cap, 5 attempts).
+
+The old HTML/`__NEXT_DATA__` fallback was dropped: Mercari's search page is now a Next.js app-router SPA with no server-rendered JSON. If the API ever breaks, a headless browser would be the only fallback — out of scope.
 
 ## Deploy to Render (free tier)
 
