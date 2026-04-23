@@ -7,7 +7,7 @@
     "hiromu takahara shoes",
     "takahara hiromu"
   ],
-  "MERCARI_CATEGORY_ID": [],
+  "MERCARI_CATEGORY_ID": [33],
   "JPY_USD_RATE": 0.0064,
   "FAILURE_ALERT_MINUTES": 30,
   "PAGE_SIZE": 40
