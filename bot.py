@@ -509,19 +509,31 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Searching: {q} ...")
     async with httpx.AsyncClient() as client:
         try:
-            raw_list = await fetch_query(client, poller.signer, q, cfg.get("MERCARI_CATEGORY_ID"), 10)
+            raw_list = await fetch_query(client, poller.signer, q, cfg.get("MERCARI_CATEGORY_ID"), 5)
         except Exception as e:
             await update.message.reply_text(f"Error: {e}")
             return
     if not raw_list:
         await update.message.reply_text("No results.")
         return
-    lines = []
-    for raw in raw_list[:10]:
-        it = normalize(raw)
-        price = f"¥{it['price']:,}" if it["price"] is not None else "?"
-        lines.append(f"• {it['title']} — {price}\n  {it['url']}")
-    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+    chat_id = str(update.effective_chat.id)
+    for raw in raw_list[:5]:
+        item = normalize(raw)
+        caption = format_caption(item, q, cfg["JPY_USD_RATE"])
+        sent = False
+        if item["thumbnail"]:
+            try:
+                await ctx.application.bot.send_photo(
+                    chat_id, photo=item["thumbnail"], caption=caption, parse_mode=ParseMode.HTML
+                )
+                sent = True
+            except TelegramError as e:
+                log.warning("/search send_photo failed (%s); falling back to text", e)
+        if not sent:
+            await ctx.application.bot.send_message(
+                chat_id, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=False
+            )
+        await asyncio.sleep(0.3)
 
 
 # ---------- lifecycle ----------
